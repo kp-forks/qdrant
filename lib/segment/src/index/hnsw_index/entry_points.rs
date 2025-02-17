@@ -37,7 +37,6 @@ impl EntryPoints {
             extra_entry_points: FixedLengthPriorityQueue::new(extra_entry_points),
         }
     }
-
     pub fn merge_from_other(&mut self, mut other: EntryPoints) {
         self.entry_points.append(&mut other.entry_points);
         // Do not merge `extra_entry_points` to prevent duplications
@@ -104,7 +103,7 @@ impl EntryPoints {
             .or_else(|| {
                 // Searching for at least some entry point
                 self.extra_entry_points
-                    .iter()
+                    .iter_unsorted()
                     .filter(|entry| checker(entry.point_id))
                     .cloned()
                     .max_by_key(|ep| ep.level)
@@ -122,10 +121,10 @@ mod tests {
     fn test_entry_points() {
         let mut points = EntryPoints::new(10);
 
-        let mut rnd = rand::thread_rng();
+        let mut rnd = rand::rng();
 
         for i in 0..1000 {
-            let level = rnd.gen_range(0..10000);
+            let level = rnd.random_range(0..10000);
             points.new_point(i, level, |_x| true);
         }
 
@@ -135,7 +134,7 @@ mod tests {
         assert!(points.entry_points[0].level > 1);
 
         for i in 1000..2000 {
-            let level = rnd.gen_range(0..10000);
+            let level = rnd.random_range(0..10000);
             points.new_point(i, level, |x| x % 5 == i % 5);
         }
 

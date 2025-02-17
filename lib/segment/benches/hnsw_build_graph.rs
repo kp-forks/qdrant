@@ -4,11 +4,12 @@ mod prof;
 use common::types::PointOffsetType;
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::rngs::StdRng;
-use rand::{thread_rng, SeedableRng};
+use rand::SeedableRng;
 use segment::fixtures::index_fixtures::{FakeFilterContext, TestRawScorerProducer};
 use segment::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use segment::index::hnsw_index::point_scorer::FilteredScorer;
 use segment::spaces::simple::CosineMetric;
+use segment::vector_storage::chunked_vector_storage::VectorOffsetType;
 
 const NUM_VECTORS: usize = 10000;
 const DIM: usize = 32;
@@ -23,13 +24,13 @@ fn hnsw_benchmark(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_function("hnsw_index", |b| {
         b.iter(|| {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let mut graph_layers_builder =
                 GraphLayersBuilder::new(NUM_VECTORS, M, M * 2, EF_CONSTRUCT, 10, USE_HEURISTIC);
             let fake_filter_context = FakeFilterContext {};
             for idx in 0..(NUM_VECTORS as PointOffsetType) {
-                let added_vector = vector_holder.vectors.get(idx).to_vec();
-                let raw_scorer = vector_holder.get_raw_scorer(added_vector);
+                let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
+                let raw_scorer = vector_holder.get_raw_scorer(added_vector).unwrap();
                 let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
                 let level = graph_layers_builder.get_random_layer(&mut rng);
                 graph_layers_builder.set_levels(idx, level);

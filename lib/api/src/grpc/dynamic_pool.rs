@@ -74,7 +74,7 @@ impl<T: Clone> Drop for CountedItem<T> {
 
 impl<T: Clone> DynamicPool<T> {
     fn random_idx() -> u64 {
-        rand::thread_rng().gen()
+        rand::rng().random()
     }
 
     pub fn new(items: Vec<T>, max_usage_per_item: usize, min_items: usize) -> Self {
@@ -200,7 +200,7 @@ mod tests {
         }
 
         for (idx, item) in pool.items.iter() {
-            println!("{} -> {:?}", idx, item);
+            println!("{idx} -> {item:?}");
         }
 
         assert!(pool.choose().is_some());

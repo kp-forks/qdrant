@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use segment::common::operation_time_statistics::{
-    OperationDurationStatistics, OperationDurationsAggregator,
-};
-use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentType, VECTOR_ELEMENT_SIZE};
+use segment::common::operation_time_statistics::OperationDurationsAggregator;
+use segment::index::sparse_index::sparse_index_config::SparseIndexType;
+use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentType, VectorName};
 
 use crate::collection_manager::holders::segment_holder::{LockedSegmentHolder, SegmentId};
 use crate::collection_manager::optimizers::segment_optimizer::{
@@ -52,18 +51,28 @@ impl ConfigMismatchOptimizer {
     }
 
     /// Check if current configuration requires vectors to be stored on disk
-    fn check_if_vectors_on_disk(&self, vector_name: &str) -> Option<bool> {
+    fn check_if_vectors_on_disk(&self, vector_name: &VectorName) -> Option<bool> {
         self.collection_params
             .vectors
             .get_params(vector_name)
             .and_then(|vector_params| vector_params.on_disk)
     }
 
+    /// Check if current configuration requires sparse vectors index to be stored on disk
+    fn check_if_sparse_vectors_index_on_disk(&self, vector_name: &VectorName) -> Option<bool> {
+        self.collection_params
+            .sparse_vectors
+            .as_ref()
+            .and_then(|vector_params| vector_params.get(vector_name))
+            .and_then(|params| params.index)
+            .and_then(|index| index.on_disk)
+    }
+
     /// Calculates and HNSW config that should be used for a given vector
     /// with current configuration.
     ///
     /// Takes vector-specific HNSW config (if any) and merges it with the collection-wide config.
-    fn get_required_hnsw_config(&self, vector_name: &str) -> Cow<HnswConfig> {
+    fn get_required_hnsw_config(&self, vector_name: &VectorName) -> Cow<HnswConfig> {
         let target_hnsw_collection = &self.hnsw_config;
         // Select vector specific target HNSW config
         let target_hnsw_vector = self
@@ -100,15 +109,9 @@ impl ConfigMismatchOptimizer {
             .filter_map(|(idx, segment)| {
                 let segment_entry = segment.get();
                 let read_segment = segment_entry.read();
-                let point_count = read_segment.available_point_count();
-                let vector_size = point_count
-                    * read_segment
-                        .vector_dims()
-                        .values()
-                        .max()
-                        .copied()
-                        .unwrap_or(0)
-                    * VECTOR_ELEMENT_SIZE;
+                let vector_size = read_segment
+                    .max_available_vectors_size_in_bytes()
+                    .unwrap_or_default();
 
                 let segment_config = read_segment.config();
 
@@ -122,8 +125,8 @@ impl ConfigMismatchOptimizer {
                     return Some((*idx, vector_size)); // Skip segments with payload mismatch
                 }
 
-                // Determine whether segment has mismatch
-                let has_mismatch =
+                // Determine whether dense data in segment has mismatch
+                let dense_has_mismatch =
                     segment_config
                         .vector_data
                         .iter()
@@ -176,7 +179,25 @@ impl ConfigMismatchOptimizer {
                             quantization_mismatch
                         });
 
-                has_mismatch.then_some((*idx, vector_size))
+                // Determine whether dense data in segment has mismatch
+                let sparse_has_mismatch =
+                    segment_config
+                        .sparse_vector_data
+                        .iter()
+                        .any(|(vector_name, vector_data)| {
+                            let Some(is_required_on_disk) =
+                                self.check_if_sparse_vectors_index_on_disk(vector_name)
+                            else {
+                                return false; // Do nothing if not specified
+                            };
+
+                            match vector_data.index.index_type {
+                                SparseIndexType::MutableRam => false, // Do nothing for mutable RAM
+                                SparseIndexType::ImmutableRam => is_required_on_disk, // Rebuild if we require on disk
+                                SparseIndexType::Mmap => !is_required_on_disk, // Rebuild if we require in RAM
+                            }
+                        });
+                (sparse_has_mismatch || dense_has_mismatch).then_some((*idx, vector_size))
             })
             .collect();
 
@@ -195,7 +216,7 @@ impl SegmentOptimizer for ConfigMismatchOptimizer {
         "config mismatch"
     }
 
-    fn collection_path(&self) -> &Path {
+    fn segments_path(&self) -> &Path {
         self.segments_path.as_path()
     }
 
@@ -227,12 +248,8 @@ impl SegmentOptimizer for ConfigMismatchOptimizer {
         self.worst_segment(segments, excluded_ids)
     }
 
-    fn get_telemetry_data(&self) -> OperationDurationStatistics {
-        self.get_telemetry_counter().lock().get_statistics()
-    }
-
-    fn get_telemetry_counter(&self) -> Arc<Mutex<OperationDurationsAggregator>> {
-        self.telemetry_durations_aggregator.clone()
+    fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
+        &self.telemetry_durations_aggregator
     }
 }
 
@@ -241,8 +258,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use common::cpu::CpuPermit;
     use parking_lot::RwLock;
+    use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
     use segment::entry::entry_point::SegmentEntry;
+    use segment::index::hnsw_index::num_rayon_threads;
     use segment::types::{
         CompressionRatio, Distance, ProductQuantization, ProductQuantizationConfig,
         ScalarQuantizationConfig, ScalarType,
@@ -254,7 +274,11 @@ mod tests {
     use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder};
     use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
     use crate::operations::config_diff::HnswConfigDiff;
-    use crate::operations::types::{VectorParams, VectorsConfig};
+    use crate::operations::types::VectorsConfig;
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+
+    const VECTOR1_NAME: &VectorName = "vector1";
+    const VECTOR2_NAME: &VectorName = "vector2";
 
     /// This test the config mismatch optimizer for a changed HNSW config
     ///
@@ -275,18 +299,14 @@ mod tests {
         // Collection configuration
         let (point_count, dim) = (1000, 10);
         let thresholds_config = OptimizerThresholds {
-            max_segment_size: std::usize::MAX,
-            memmap_threshold: std::usize::MAX,
-            indexing_threshold: 10,
+            max_segment_size_kb: usize::MAX,
+            memmap_threshold_kb: usize::MAX,
+            indexing_threshold_kb: 10,
         };
         let collection_params = CollectionParams {
-            vectors: VectorsConfig::Single(VectorParams {
-                size: dim.try_into().unwrap(),
-                distance: Distance::Dot,
-                hnsw_config: None,
-                quantization_config: None,
-                on_disk: None,
-            }),
+            vectors: VectorsConfig::Single(
+                VectorParamsBuilder::new(dim as u64, Distance::Dot).build(),
+            ),
             ..CollectionParams::empty()
         };
 
@@ -297,7 +317,7 @@ mod tests {
 
         let segment = random_segment(dir.path(), 100, point_count, dim as usize);
 
-        let segment_id = holder.add(segment);
+        let segment_id = holder.add_new(segment);
         let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
 
         let hnsw_config = HnswConfig {
@@ -311,7 +331,8 @@ mod tests {
 
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
-            thresholds_config.clone(),
+            2,
+            thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
@@ -327,11 +348,19 @@ mod tests {
             Default::default(),
         );
 
+        let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+
         // Use indexing optimizer to build index for HNSW mismatch test
         let changed = index_optimizer
-            .optimize(locked_holder.clone(), vec![segment_id], &false.into())
+            .optimize(
+                locked_holder.clone(),
+                vec![segment_id],
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
             "optimized segment should be gone",
@@ -350,13 +379,19 @@ mod tests {
         config_mismatch_optimizer.hnsw_config = changed_hnsw_config.clone();
 
         // Run mismatch optimizer again, make sure it optimizes now
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
             config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(locked_holder.clone(), suggested_to_optimize, &false.into())
+            .optimize(
+                locked_holder.clone(),
+                suggested_to_optimize,
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed HNSW config
         locked_holder
@@ -369,7 +404,7 @@ mod tests {
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(
-                    segment.config().vector_data[""].index,
+                    segment.config().vector_data[DEFAULT_VECTOR_NAME].index,
                     Indexes::Hnsw(changed_hnsw_config.clone()),
                     "segment must be optimized with changed HNSW config",
                 );
@@ -398,9 +433,9 @@ mod tests {
         // Collection configuration
         let (point_count, vector1_dim, vector2_dim) = (1000, 10, 20);
         let thresholds_config = OptimizerThresholds {
-            max_segment_size: std::usize::MAX,
-            memmap_threshold: std::usize::MAX,
-            indexing_threshold: 10,
+            max_segment_size_kb: usize::MAX,
+            memmap_threshold_kb: usize::MAX,
+            indexing_threshold_kb: 10,
         };
         let hnsw_config_vector1 = HnswConfigDiff {
             m: Some(10),
@@ -411,24 +446,14 @@ mod tests {
         let collection_params = CollectionParams {
             vectors: VectorsConfig::Multi(BTreeMap::from([
                 (
-                    "vector1".into(),
-                    VectorParams {
-                        size: vector1_dim.try_into().unwrap(),
-                        distance: Distance::Dot,
-                        hnsw_config: Some(hnsw_config_vector1),
-                        quantization_config: None,
-                        on_disk: None,
-                    },
+                    VECTOR1_NAME.to_owned(),
+                    VectorParamsBuilder::new(vector1_dim as u64, Distance::Dot)
+                        .with_hnsw_config(hnsw_config_vector1)
+                        .build(),
                 ),
                 (
-                    "vector2".into(),
-                    VectorParams {
-                        size: vector2_dim.try_into().unwrap(),
-                        distance: Distance::Dot,
-                        hnsw_config: None,
-                        quantization_config: None,
-                        on_disk: None,
-                    },
+                    VECTOR2_NAME.to_owned(),
+                    VectorParamsBuilder::new(vector2_dim as u64, Distance::Dot).build(),
                 ),
             ])),
             ..CollectionParams::empty()
@@ -447,7 +472,7 @@ mod tests {
             vector2_dim as usize,
         );
 
-        let segment_id = holder.add(segment);
+        let segment_id = holder.add_new(segment);
         let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
 
         let hnsw_config_collection = HnswConfig {
@@ -459,9 +484,13 @@ mod tests {
             payload_m: None,
         };
 
+        let permit_cpu_count = num_rayon_threads(hnsw_config_collection.max_indexing_threads);
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
-            thresholds_config.clone(),
+            2,
+            thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
@@ -479,9 +508,14 @@ mod tests {
 
         // Use indexing optimizer to build index for HNSW mismatch test
         let changed = index_optimizer
-            .optimize(locked_holder.clone(), vec![segment_id], &false.into())
+            .optimize(
+                locked_holder.clone(),
+                vec![segment_id],
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
             "optimized segment should be gone",
@@ -500,7 +534,7 @@ mod tests {
         match config_mismatch_optimizer.collection_params.vectors {
             VectorsConfig::Single(_) => unreachable!(),
             VectorsConfig::Multi(ref mut map) => {
-                map.get_mut("vector2")
+                map.get_mut(VECTOR2_NAME)
                     .unwrap()
                     .hnsw_config
                     .replace(hnsw_config_vector2);
@@ -508,13 +542,19 @@ mod tests {
         }
 
         // Run mismatch optimizer again, make sure it optimizes now
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
             config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(locked_holder.clone(), suggested_to_optimize, &false.into())
+            .optimize(
+                locked_holder.clone(),
+                suggested_to_optimize,
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed HNSW config
         locked_holder
@@ -527,12 +567,12 @@ mod tests {
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(
-                    segment.config().vector_data["vector1"].index,
+                    segment.config().vector_data[VECTOR1_NAME].index,
                     Indexes::Hnsw(hnsw_config_vector1.update(&hnsw_config_collection).unwrap()),
                     "HNSW config of vector1 is not what we expect",
                 );
                 assert_eq!(
-                    segment.config().vector_data["vector2"].index,
+                    segment.config().vector_data[VECTOR2_NAME].index,
                     Indexes::Hnsw(hnsw_config_vector2.update(&hnsw_config_collection).unwrap()),
                     "HNSW config of vector2 is not what we expect",
                 );
@@ -561,9 +601,9 @@ mod tests {
         // Collection configuration
         let (point_count, vector1_dim, vector2_dim) = (1000, 10, 20);
         let thresholds_config = OptimizerThresholds {
-            max_segment_size: std::usize::MAX,
-            memmap_threshold: std::usize::MAX,
-            indexing_threshold: 10,
+            max_segment_size_kb: usize::MAX,
+            memmap_threshold_kb: usize::MAX,
+            indexing_threshold_kb: 10,
         };
         let quantization_config_vector1 =
             QuantizationConfig::Scalar(segment::types::ScalarQuantization {
@@ -576,24 +616,14 @@ mod tests {
         let collection_params = CollectionParams {
             vectors: VectorsConfig::Multi(BTreeMap::from([
                 (
-                    "vector1".into(),
-                    VectorParams {
-                        size: vector1_dim.try_into().unwrap(),
-                        distance: Distance::Dot,
-                        hnsw_config: None,
-                        quantization_config: Some(quantization_config_vector1.clone()),
-                        on_disk: None,
-                    },
+                    VECTOR1_NAME.to_owned(),
+                    VectorParamsBuilder::new(vector1_dim as u64, Distance::Dot)
+                        .with_quantization_config(quantization_config_vector1.clone())
+                        .build(),
                 ),
                 (
-                    "vector2".into(),
-                    VectorParams {
-                        size: vector2_dim.try_into().unwrap(),
-                        distance: Distance::Dot,
-                        hnsw_config: None,
-                        quantization_config: None,
-                        on_disk: None,
-                    },
+                    VECTOR2_NAME.to_owned(),
+                    VectorParamsBuilder::new(vector2_dim as u64, Distance::Dot).build(),
                 ),
             ])),
             ..CollectionParams::empty()
@@ -612,7 +642,7 @@ mod tests {
             vector2_dim as usize,
         );
 
-        let segment_id = holder.add(segment);
+        let segment_id = holder.add_new(segment);
         let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
 
         let quantization_config_collection =
@@ -626,7 +656,8 @@ mod tests {
 
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
-            thresholds_config.clone(),
+            2,
+            thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
@@ -642,11 +673,19 @@ mod tests {
             Some(quantization_config_collection),
         );
 
+        let permit_cpu_count = num_rayon_threads(0);
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+
         // Use indexing optimizer to build index for quantization mismatch test
         let changed = index_optimizer
-            .optimize(locked_holder.clone(), vec![segment_id], &false.into())
+            .optimize(
+                locked_holder.clone(),
+                vec![segment_id],
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
             "optimized segment should be gone",
@@ -668,7 +707,7 @@ mod tests {
         match config_mismatch_optimizer.collection_params.vectors {
             VectorsConfig::Single(_) => unreachable!(),
             VectorsConfig::Multi(ref mut map) => {
-                map.get_mut("vector2")
+                map.get_mut(VECTOR2_NAME)
                     .unwrap()
                     .quantization_config
                     .replace(quantization_config_vector2.clone());
@@ -676,13 +715,19 @@ mod tests {
         }
 
         // Run mismatch optimizer again, make sure it optimizes now
+        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
             config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(locked_holder.clone(), suggested_to_optimize, &false.into())
+            .optimize(
+                locked_holder.clone(),
+                suggested_to_optimize,
+                permit,
+                &false.into(),
+            )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed quantization config
         locked_holder
@@ -695,12 +740,12 @@ mod tests {
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(
-                    segment.config().vector_data["vector1"].quantization_config,
+                    segment.config().vector_data[VECTOR1_NAME].quantization_config,
                     Some(quantization_config_vector1.clone()),
                     "Quantization config of vector1 is not what we expect",
                 );
                 assert_eq!(
-                    segment.config().vector_data["vector2"].quantization_config,
+                    segment.config().vector_data[VECTOR2_NAME].quantization_config,
                     Some(quantization_config_vector2.clone()),
                     "Quantization config of vector2 is not what we expect",
                 );

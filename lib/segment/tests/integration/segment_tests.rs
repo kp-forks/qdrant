@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::sync::atomic::AtomicBool;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use itertools::Itertools;
 use segment::common::operation_error::OperationError;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::{only_default_vector, VectorStruct, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{
+    only_default_vector, VectorRef, VectorStructInternal, DEFAULT_VECTOR_NAME,
+};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::index_fixtures::random_vector;
 use segment::segment_constructor::load_segment;
@@ -33,20 +37,15 @@ fn test_point_exclusion() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
-    let best_match = res.get(0).expect("Non-empty result");
+    let best_match = res.first().expect("Non-empty result");
     assert_eq!(best_match.id, 3.into());
 
     let ids: HashSet<_> = HashSet::from_iter([3.into()]);
 
-    let frt = Filter {
-        should: None,
-        must: None,
-        must_not: Some(vec![Condition::HasId(ids.into())]),
-    };
+    let frt = Filter::new_must_not(Condition::HasId(ids.into()));
 
     let res = segment
         .search(
@@ -57,11 +56,10 @@ fn test_point_exclusion() {
             Some(&frt),
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
-    let best_match = res.get(0).expect("Non-empty result");
+    let best_match = res.first().expect("Non-empty result");
     assert_ne!(best_match.id, 3.into());
 
     let point_ids1: Vec<_> = segment.iter_points().collect();
@@ -92,17 +90,17 @@ fn test_named_vector_search() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
-    let best_match = res.get(0).expect("Non-empty result");
+    let best_match = res.first().expect("Non-empty result");
     assert_eq!(best_match.id, 3.into());
 
     let ids: HashSet<_> = HashSet::from_iter([3.into()]);
 
     let frt = Filter {
         should: None,
+        min_should: None,
         must: None,
         must_not: Some(vec![Condition::HasId(ids.into())]),
     };
@@ -116,11 +114,10 @@ fn test_named_vector_search() {
             Some(&frt),
             1,
             None,
-            &false.into(),
         )
         .unwrap();
 
-    let best_match = res.get(0).expect("Non-empty result");
+    let best_match = res.first().expect("Non-empty result");
     assert_ne!(best_match.id, 3.into());
 
     let point_ids1: Vec<_> = segment.iter_points().collect();
@@ -137,14 +134,17 @@ fn test_missed_vector_name() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let mut segment = build_segment_3(dir.path());
 
+    let hw_counter = HardwareCounterCell::new();
+
     let exists = segment
         .upsert_point(
             7,
             1.into(),
-            NamedVectors::from([
-                ("vector2".to_owned(), vec![10.]),
-                ("vector3".to_owned(), vec![5., 6., 7., 8.]),
+            NamedVectors::from_pairs([
+                ("vector2".into(), vec![10.]),
+                ("vector3".into(), vec![5., 6., 7., 8.]),
             ]),
+            &hw_counter,
         )
         .unwrap();
     assert!(exists, "this partial vector should overwrite existing");
@@ -153,10 +153,11 @@ fn test_missed_vector_name() {
         .upsert_point(
             8,
             6.into(),
-            NamedVectors::from([
-                ("vector2".to_owned(), vec![10.]),
-                ("vector3".to_owned(), vec![5., 6., 7., 8.]),
+            NamedVectors::from_pairs([
+                ("vector2".into(), vec![10.]),
+                ("vector3".into(), vec![5., 6., 7., 8.]),
             ]),
+            &hw_counter,
         )
         .unwrap();
     assert!(!exists, "this partial vector should not existing");
@@ -167,19 +168,22 @@ fn test_vector_name_not_exists() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let mut segment = build_segment_3(dir.path());
 
+    let hw_counter = HardwareCounterCell::new();
+
     let result = segment.upsert_point(
         6,
         6.into(),
-        NamedVectors::from([
-            ("vector1".to_owned(), vec![5., 6., 7., 8.]),
-            ("vector2".to_owned(), vec![10.]),
-            ("vector3".to_owned(), vec![5., 6., 7., 8.]),
-            ("vector4".to_owned(), vec![5., 6., 7., 8.]),
+        NamedVectors::from_pairs([
+            ("vector1".into(), vec![5., 6., 7., 8.]),
+            ("vector2".into(), vec![10.]),
+            ("vector3".into(), vec![5., 6., 7., 8.]),
+            ("vector4".into(), vec![5., 6., 7., 8.]),
         ]),
+        &hw_counter,
     );
 
     if let Err(OperationError::VectorNameNotExists { received_name }) = result {
-        assert!(received_name == "vector4");
+        assert_eq!(received_name, "vector4");
     } else {
         panic!("wrong upsert result")
     }
@@ -189,15 +193,19 @@ fn test_vector_name_not_exists() {
 fn ordered_deletion_test() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     let path = {
         let mut segment = build_segment_1(dir.path());
-        segment.delete_point(6, 5.into()).unwrap();
-        segment.delete_point(6, 4.into()).unwrap();
-        segment.flush(true).unwrap();
+        segment.delete_point(6, 5.into(), &hw_counter).unwrap();
+        segment.delete_point(6, 4.into(), &hw_counter).unwrap();
+        segment.flush(true, false).unwrap();
         segment.current_path.clone()
     };
 
-    let segment = load_segment(&path).unwrap().unwrap();
+    let segment = load_segment(&path, &AtomicBool::new(false))
+        .unwrap()
+        .unwrap();
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
 
     let res = segment
@@ -209,10 +217,9 @@ fn ordered_deletion_test() {
             None,
             1,
             None,
-            &false.into(),
         )
         .unwrap();
-    let best_match = res.get(0).expect("Non-empty result");
+    let best_match = res.first().expect("Non-empty result");
     assert_eq!(best_match.id, 3.into());
 }
 
@@ -220,18 +227,20 @@ fn ordered_deletion_test() {
 fn skip_deleted_segment() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     let path = {
         let mut segment = build_segment_1(dir.path());
-        segment.delete_point(6, 5.into()).unwrap();
-        segment.delete_point(6, 4.into()).unwrap();
-        segment.flush(true).unwrap();
+        segment.delete_point(6, 5.into(), &hw_counter).unwrap();
+        segment.delete_point(6, 4.into(), &hw_counter).unwrap();
+        segment.flush(true, false).unwrap();
         segment.current_path.clone()
     };
 
     let new_path = path.with_extension("deleted");
     std::fs::rename(&path, new_path).unwrap();
 
-    let segment = load_segment(&path).unwrap();
+    let segment = load_segment(&path, &AtomicBool::new(false)).unwrap();
 
     assert!(segment.is_none());
 }
@@ -240,11 +249,13 @@ fn skip_deleted_segment() {
 fn test_update_named_vector() {
     let num_points = 25;
     let dim = 4;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let distance = Distance::Cosine;
     let vectors = (0..num_points)
         .map(|_| random_vector(&mut rng, dim))
         .collect_vec();
+
+    let hw_counter = HardwareCounterCell::new();
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
@@ -252,7 +263,7 @@ fn test_update_named_vector() {
     for (i, vec) in vectors.iter().enumerate() {
         let i = i as u64;
         segment
-            .upsert_point(i, i.into(), only_default_vector(vec))
+            .upsert_point(i, i.into(), only_default_vector(vec), &hw_counter)
             .unwrap();
     }
 
@@ -274,20 +285,21 @@ fn test_update_named_vector() {
             None,
             1,
             Some(&search_params),
-            &false.into(),
         )
         .unwrap();
-    let nearest_upsert = nearest_upsert.get(0).unwrap();
+    let nearest_upsert = nearest_upsert.first().unwrap();
 
     let sqrt_distance = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
 
     // check if nearest_upsert is normalized
     match &nearest_upsert.vector {
-        Some(VectorStruct::Single(v)) => {
+        Some(VectorStructInternal::Single(v)) => {
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
-        Some(VectorStruct::Multi(v)) => {
-            assert!((sqrt_distance(&v[DEFAULT_VECTOR_NAME]) - 1.).abs() < 1e-5);
+        Some(VectorStructInternal::Named(v)) => {
+            let v: VectorRef = (&v[DEFAULT_VECTOR_NAME]).into();
+            let v: &[_] = v.try_into().unwrap();
+            assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
         _ => panic!("unexpected vector type"),
     }
@@ -296,7 +308,12 @@ fn test_update_named_vector() {
     for (i, vec) in vectors.iter().enumerate() {
         let i = i as u64;
         segment
-            .update_vectors(i + num_points as u64, i.into(), only_default_vector(vec))
+            .update_vectors(
+                i + num_points as u64,
+                i.into(),
+                only_default_vector(vec),
+                &hw_counter,
+            )
             .unwrap();
     }
 
@@ -310,18 +327,19 @@ fn test_update_named_vector() {
             None,
             1,
             Some(&search_params),
-            &false.into(),
         )
         .unwrap();
-    let nearest_update = nearest_update.get(0).unwrap();
+    let nearest_update = nearest_update.first().unwrap();
 
     // check that nearest_upsert is normalized
     match &nearest_update.vector {
-        Some(VectorStruct::Single(v)) => {
+        Some(VectorStructInternal::Single(v)) => {
             assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
-        Some(VectorStruct::Multi(v)) => {
-            assert!((sqrt_distance(&v[DEFAULT_VECTOR_NAME]) - 1.).abs() < 1e-5);
+        Some(VectorStructInternal::Named(v)) => {
+            let v: VectorRef = (&v[DEFAULT_VECTOR_NAME]).into();
+            let v: &[_] = v.try_into().unwrap();
+            assert!((sqrt_distance(v) - 1.).abs() < 1e-5);
         }
         _ => panic!("unexpected vector type"),
     }

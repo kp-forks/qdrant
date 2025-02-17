@@ -1,16 +1,34 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
 use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::json_path::JsonPath;
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::payload_storage::PayloadStorage;
-use crate::types::{Payload, PayloadKeyTypeRef};
+use crate::types::Payload;
 
 impl PayloadStorage for InMemoryPayloadStorage {
-    fn assign(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
+    fn overwrite(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
+    ) -> OperationResult<()> {
+        self.payload.insert(point_id, payload.to_owned());
+        Ok(())
+    }
+
+    fn set(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
+    ) -> OperationResult<()> {
         match self.payload.get_mut(&point_id) {
             Some(point_payload) => point_payload.merge(payload),
             None => {
@@ -20,7 +38,29 @@ impl PayloadStorage for InMemoryPayloadStorage {
         Ok(())
     }
 
-    fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload> {
+    fn set_by_key(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &JsonPath,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<()> {
+        match self.payload.get_mut(&point_id) {
+            Some(point_payload) => point_payload.merge_by_key(payload, key),
+            None => {
+                let mut dest_payload = Payload::default();
+                dest_payload.merge_by_key(payload, key);
+                self.payload.insert(point_id, dest_payload);
+            }
+        }
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        point_id: PointOffsetType,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<Payload> {
         match self.payload.get(&point_id) {
             Some(payload) => Ok(payload.to_owned()),
             None => Ok(Default::default()),
@@ -30,7 +70,8 @@ impl PayloadStorage for InMemoryPayloadStorage {
     fn delete(
         &mut self,
         point_id: PointOffsetType,
-        key: PayloadKeyTypeRef,
+        key: &JsonPath,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
     ) -> OperationResult<Vec<Value>> {
         match self.payload.get_mut(&point_id) {
             Some(payload) => {
@@ -41,18 +82,52 @@ impl PayloadStorage for InMemoryPayloadStorage {
         }
     }
 
-    fn drop(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
+    fn clear(
+        &mut self,
+        point_id: PointOffsetType,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<Option<Payload>> {
         let res = self.payload.remove(&point_id);
         Ok(res)
     }
 
-    fn wipe(&mut self) -> OperationResult<()> {
+    fn wipe(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
         self.payload = HashMap::new();
         Ok(())
     }
 
     fn flusher(&self) -> Flusher {
         Box::new(|| Ok(()))
+    }
+
+    fn iter<F>(&self, mut callback: F) -> OperationResult<()>
+    where
+        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
+    {
+        for (key, val) in self.payload.iter() {
+            let do_continue = callback(*key, val)?;
+            if !do_continue {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
+    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        let mut estimated_size = 0;
+        for (_p_id, val) in self.payload.iter() {
+            // account for point_id
+            estimated_size += size_of::<PointOffsetType>();
+            for (key, val) in val.0.iter() {
+                // account for key and value
+                estimated_size += key.len() + serde_json::to_string(val).unwrap().len()
+            }
+        }
+        Ok(estimated_size)
     }
 }
 
@@ -88,10 +163,11 @@ mod tests {
 
         let query = Filter {
             should: None,
+            min_should: None,
             must: Some(vec![
-                Condition::Field(FieldCondition::new_match("age".to_string(), 43.into())),
+                Condition::Field(FieldCondition::new_match(JsonPath::new("age"), 43.into())),
                 Condition::Field(FieldCondition::new_match(
-                    "name".to_string(),
+                    JsonPath::new("name"),
                     "John Doe".to_string().into(),
                 )),
             ]),
@@ -112,6 +188,7 @@ mod tests {
                 payload.borrow().as_ref().cloned().unwrap()
             }),
             Some(&id_tracker),
+            &HashMap::new(),
             &query,
             0,
             &IndexesMap::new(),
@@ -122,14 +199,16 @@ mod tests {
     fn test_wipe() {
         let mut storage = InMemoryPayloadStorage::default();
         let payload: Payload = serde_json::from_str(r#"{"name": "John Doe"}"#).unwrap();
-        storage.assign(100, &payload).unwrap();
-        storage.wipe().unwrap();
-        storage.assign(100, &payload).unwrap();
-        storage.wipe().unwrap();
-        storage.assign(100, &payload).unwrap();
-        assert!(!storage.payload(100).unwrap().is_empty());
-        storage.wipe().unwrap();
-        assert_eq!(storage.payload(100).unwrap(), Default::default());
+
+        let hw_counter = HardwareCounterCell::new();
+
+        storage.set(100, &payload, &hw_counter).unwrap();
+        storage.wipe(&hw_counter).unwrap();
+        storage.set(100, &payload, &hw_counter).unwrap();
+        storage.wipe(&hw_counter).unwrap();
+        storage.set(100, &payload, &hw_counter).unwrap();
+        assert!(!storage.get(100, &hw_counter).unwrap().is_empty());
+        storage.wipe(&hw_counter).unwrap();
     }
 
     #[test]
@@ -156,10 +235,12 @@ mod tests {
             }
         }"#;
 
+        let hw_counter = HardwareCounterCell::new();
+
         let payload: Payload = serde_json::from_str(data).unwrap();
         let mut storage = InMemoryPayloadStorage::default();
-        storage.assign(100, &payload).unwrap();
-        let pload = storage.payload(100).unwrap();
+        storage.set(100, &payload, &hw_counter).unwrap();
+        let pload = storage.get(100, &hw_counter).unwrap();
         assert_eq!(pload, payload);
     }
 }
