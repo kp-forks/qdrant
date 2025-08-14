@@ -178,40 +178,43 @@ where
     Vec<T>: Blob,
 {
     #[cfg(feature = "rocksdb")]
-    pub fn new_rocksdb(db: Arc<RwLock<DB>>, field: &str, is_appendable: bool) -> Self {
+    pub fn new_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        is_appendable: bool,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         if is_appendable {
-            NumericIndexInner::Mutable(MutableNumericIndex::open_rocksdb(db, field))
+            Ok(
+                MutableNumericIndex::open_rocksdb(db, field, create_if_missing)?
+                    .map(NumericIndexInner::Mutable),
+            )
         } else {
-            NumericIndexInner::Immutable(ImmutableNumericIndex::open_rocksdb(db, field))
+            Ok(ImmutableNumericIndex::open_rocksdb(db, field)?.map(NumericIndexInner::Immutable))
         }
     }
 
     /// Load immutable mmap based index, either in RAM or on disk
-    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
-        let mmap_index = MmapNumericIndex::open(path, is_on_disk)?;
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Option<Self>> {
+        let Some(mmap_index) = MmapNumericIndex::open(path, is_on_disk)? else {
+            // Files don't exist, cannot load
+            return Ok(None);
+        };
+
         if is_on_disk {
             // Use on mmap directly
-            Ok(NumericIndexInner::Mmap(mmap_index))
+            Ok(Some(NumericIndexInner::Mmap(mmap_index)))
         } else {
             // Load into RAM, use mmap as backing storage
-            Ok(NumericIndexInner::Immutable(
+            Ok(Some(NumericIndexInner::Immutable(
                 ImmutableNumericIndex::open_mmap(mmap_index),
-            ))
+            )))
         }
     }
 
-    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Self> {
-        Ok(NumericIndexInner::Mutable(
-            MutableNumericIndex::open_gridstore(dir, create_if_missing)?,
-        ))
-    }
-
-    pub fn load(&mut self) -> OperationResult<bool> {
-        match self {
-            NumericIndexInner::Mutable(index) => index.load(),
-            NumericIndexInner::Immutable(index) => index.load(),
-            NumericIndexInner::Mmap(index) => index.load(),
-        }
+    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        Ok(MutableNumericIndex::open_gridstore(dir, create_if_missing)?
+            .map(NumericIndexInner::Mutable))
     }
 
     fn get_histogram(&self) -> &Histogram<T> {
@@ -516,34 +519,56 @@ where
     Vec<T>: Blob,
 {
     #[cfg(feature = "rocksdb")]
-    pub fn new_rocksdb(db: Arc<RwLock<DB>>, field: &str, is_appendable: bool) -> Self {
-        Self {
-            inner: NumericIndexInner::new_rocksdb(db, field, is_appendable),
-            _phantom: PhantomData,
-        }
+    pub fn new_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        is_appendable: bool,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
+        Ok(
+            NumericIndexInner::new_rocksdb(db, field, is_appendable, create_if_missing)?.map(
+                |inner| Self {
+                    inner,
+                    _phantom: PhantomData,
+                },
+            ),
+        )
     }
 
     /// Load immutable mmap based index, either in RAM or on disk
-    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
-        Ok(Self {
-            inner: NumericIndexInner::new_mmap(path, is_on_disk)?,
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Option<Self>> {
+        let index = NumericIndexInner::new_mmap(path, is_on_disk)?;
+
+        Ok(index.map(|inner| Self {
+            inner,
             _phantom: PhantomData,
-        })
+        }))
     }
 
-    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Self> {
-        Ok(Self {
-            inner: NumericIndexInner::new_gridstore(dir, create_if_missing)?,
+    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        let index = NumericIndexInner::new_gridstore(dir, create_if_missing)?;
+
+        Ok(index.map(|inner| Self {
+            inner,
             _phantom: PhantomData,
-        })
+        }))
     }
 
     #[cfg(feature = "rocksdb")]
-    pub fn builder_rocksdb(db: Arc<RwLock<DB>>, field: &str) -> NumericIndexBuilder<T, P>
+    pub fn builder_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+    ) -> OperationResult<NumericIndexBuilder<T, P>>
     where
         Self: ValueIndexer<ValueType = P>,
     {
-        NumericIndexBuilder(Self::new_rocksdb(db, field, true))
+        Ok(NumericIndexBuilder(
+            Self::new_rocksdb(db, field, true, true)?.ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Failed to create and load mutable numeric index builder for field '{field}'",
+                ))
+            })?,
+        ))
     }
 
     #[cfg(all(test, feature = "rocksdb"))]
@@ -555,7 +580,10 @@ where
         Self: ValueIndexer<ValueType = P>,
     {
         NumericIndexImmutableBuilder {
-            index: Self::new_rocksdb(db.clone(), field, true),
+            index: Self::new_rocksdb(db.clone(), field, true, true)
+                // unwrap safety: only used in testing
+                .unwrap()
+                .unwrap(),
             field: field.to_owned(),
             db,
         }
@@ -611,7 +639,6 @@ where
             pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool, hw_counter: &HardwareCounterCell) -> bool;
             pub fn cleanup(self) -> OperationResult<()>;
             pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry;
-            pub fn load(&mut self) -> OperationResult<bool>;
             pub fn values_count(&self, idx: PointOffsetType) -> usize;
             pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
             pub fn values_is_empty(&self, idx: PointOffsetType) -> bool;
@@ -709,9 +736,10 @@ where
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
         self.index.inner.flusher()()?;
         drop(self.index);
-        let mut inner: NumericIndexInner<T> =
-            NumericIndexInner::new_rocksdb(self.db, &self.field, false);
-        inner.load()?;
+        let inner: NumericIndexInner<T> =
+            NumericIndexInner::new_rocksdb(self.db, &self.field, false, false)?
+                // unwrap safety: only used in testing
+                .unwrap();
         Ok(NumericIndex {
             inner,
             _phantom: PhantomData,
@@ -812,8 +840,11 @@ where
             self.index.is_none(),
             "index must be initialized exactly once",
         );
-        self.index
-            .replace(NumericIndex::new_gridstore(self.dir.clone(), true)?);
+        self.index.replace(
+            NumericIndex::new_gridstore(self.dir.clone(), true)?
+                // unwrap safety: cannot fail because create_if_missing is true
+                .unwrap(),
+        );
         Ok(())
     }
 
@@ -849,10 +880,6 @@ where
 {
     fn count_indexed_points(&self) -> usize {
         self.get_points_count()
-    }
-
-    fn load(&mut self) -> OperationResult<bool> {
-        NumericIndexInner::load(self)
     }
 
     fn cleanup(self) -> OperationResult<()> {

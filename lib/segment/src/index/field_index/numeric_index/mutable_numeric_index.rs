@@ -53,7 +53,7 @@ where
 {
     #[cfg(feature = "rocksdb")]
     RocksDb(DatabaseColumnScheduledDeleteWrapper),
-    Gridstore(Option<Arc<RwLock<Gridstore<Vec<T>>>>>),
+    Gridstore(Arc<RwLock<Gridstore<Vec<T>>>>),
 }
 
 // Numeric Index with insertions and deletions without persistence
@@ -113,10 +113,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> InMemoryNumericIndex<T> {
     ///
     /// Expensive because this reads the full mmap index.
     pub(super) fn from_mmap(mmap_index: &MmapNumericIndex<T>) -> Self {
-        let point_count = mmap_index
-            .storage
-            .as_ref()
-            .map_or(0, |storage| storage.point_to_values.len());
+        let point_count = mmap_index.storage.point_to_values.len();
 
         (0..point_count as PointOffsetType)
             .filter_map(|idx| mmap_index.get_values(idx).map(|values| (idx, values)))
@@ -247,90 +244,37 @@ impl<T: Encodable + Numericable + Send + Sync + Default> MutableNumericIndex<T>
 where
     Vec<T>: Blob,
 {
-    /// Open mutable numeric index from RocksDB storage
-    ///
-    /// Note: after opening, the data must be loaded into memory separately using [`load`].
+    /// Open and load mutable numeric index from RocksDB storage
     #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb(db: Arc<RwLock<DB>>, field: &str) -> Self {
+    pub fn open_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         let store_cf_name = super::numeric_index_storage_cf_name(field);
         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
             db,
             &store_cf_name,
         ));
-        Self::open_rocksdb_db_wrapper(db_wrapper)
+        Self::open_rocksdb_db_wrapper(db_wrapper, create_if_missing)
     }
 
     #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb_db_wrapper(db_wrapper: DatabaseColumnScheduledDeleteWrapper) -> Self {
-        Self {
-            storage: Storage::RocksDb(db_wrapper),
-            in_memory_index: InMemoryNumericIndex::default(),
-        }
-    }
-
-    /// Open mutable numeric index from Gridstore storage
-    ///
-    /// Note: after opening, the data must be loaded into memory separately using [`load`].
-    ///
-    /// The `create_if_missing` parameter indicates whether to create a new Gridstore if it does
-    /// not exist. If false and files don't exist, the load function will indicate nothing could be
-    /// loaded.
-    pub fn open_gridstore(path: PathBuf, create_if_missing: bool) -> OperationResult<Self> {
-        let store = if create_if_missing {
-            let options = default_gridstore_options::<T>();
-            Some(Arc::new(RwLock::new(
-                Gridstore::open_or_create(path, options).map_err(|err| {
-                    OperationError::service_error(format!(
-                        "failed to open mutable numeric index on gridstore: {err}"
-                    ))
-                })?,
-            )))
-        } else if path.exists() {
-            Some(Arc::new(RwLock::new(Gridstore::open(path).map_err(
-                |err| {
-                    OperationError::service_error(format!(
-                        "failed to open mutable numeric index on gridstore: {err}"
-                    ))
-                },
-            )?)))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            storage: Storage::Gridstore(store),
-            in_memory_index: InMemoryNumericIndex::default(),
-        })
-    }
-
-    /// Load storage
-    ///
-    /// Loads in-memory index from backing RocksDB or Gridstore storage.
-    pub(super) fn load(&mut self) -> OperationResult<bool> {
-        match self.storage {
-            #[cfg(feature = "rocksdb")]
-            Storage::RocksDb(_) => self.load_rocksdb(),
-            Storage::Gridstore(Some(_)) => self.load_gridstore(),
-            Storage::Gridstore(None) => Ok(false),
-        }
-    }
-
-    /// Load from RocksDB storage
-    ///
-    /// Loads in-memory index from RocksDB storage.
-    #[cfg(feature = "rocksdb")]
-    fn load_rocksdb(&mut self) -> OperationResult<bool> {
-        let Storage::RocksDb(db_wrapper) = &self.storage else {
-            return Err(OperationError::service_error(
-                "Failed to load index from RocksDB, using different storage backend",
-            ));
-        };
-
+    pub fn open_rocksdb_db_wrapper(
+        db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         if !db_wrapper.has_column_family()? {
-            return Ok(false);
+            if create_if_missing {
+                db_wrapper.recreate_column_family()?;
+            } else {
+                // Column family doesn't exist, cannot load
+                return Ok(None);
+            }
         };
 
-        self.in_memory_index = db_wrapper
+        // Load in-memory index from RocksDB
+        let in_memory_index = db_wrapper
             .lock_db()
             .iter()?
             .map(|(key, value)| {
@@ -348,27 +292,44 @@ where
             })
             .collect::<Result<InMemoryNumericIndex<_>, OperationError>>()?;
 
-        Ok(true)
+        Ok(Some(Self {
+            storage: Storage::RocksDb(db_wrapper),
+            in_memory_index,
+        }))
     }
 
-    /// Load from Gridstore storage
+    /// Open and load mutable numeric index from Gridstore storage
     ///
-    /// Loads in-memory index from Gridstore storage.
-    fn load_gridstore(&mut self) -> OperationResult<bool> {
-        #[allow(irrefutable_let_patterns)]
-        let Storage::Gridstore(Some(store)) = &self.storage else {
-            return Err(OperationError::service_error(
-                "Failed to load index from Gridstore, using different storage backend",
-            ));
+    /// The `create_if_missing` parameter indicates whether to create a new Gridstore if it does
+    /// not exist. If false and files don't exist, this will return `None` to indicate nothing
+    /// could be loaded.
+    pub fn open_gridstore(path: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        let store = if create_if_missing {
+            let options = default_gridstore_options::<T>();
+            Gridstore::open_or_create(path, options).map_err(|err| {
+                OperationError::service_error(format!(
+                    "failed to open mutable numeric index on gridstore: {err}"
+                ))
+            })?
+        } else if path.exists() {
+            Gridstore::open(path).map_err(|err| {
+                OperationError::service_error(format!(
+                    "failed to open mutable numeric index on gridstore: {err}"
+                ))
+            })?
+        } else {
+            // Files don't exist, cannot load
+            return Ok(None);
         };
 
+        // Load in-memory index from Gridstore
+        let mut in_memory_index = InMemoryNumericIndex::default();
         let hw_counter = HardwareCounterCell::disposable();
         let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
         store
-            .read()
             .iter::<_, ()>(
-                |idx, values| {
-                    self.in_memory_index.add_many_to_list(idx, values.clone());
+                |idx, values: Vec<T>| {
+                    in_memory_index.add_many_to_list(idx, values);
                     Ok(true)
                 },
                 hw_counter_ref,
@@ -376,7 +337,10 @@ where
             // unwrap safety: never returns an error
             .unwrap();
 
-        Ok(true)
+        Ok(Some(Self {
+            storage: Storage::Gridstore(Arc::new(RwLock::new(store))),
+            in_memory_index,
+        }))
     }
 
     pub fn into_in_memory_index(self) -> InMemoryNumericIndex<T> {
@@ -397,12 +361,11 @@ where
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.recreate_column_family(),
-            Storage::Gridstore(Some(store)) => store.write().clear().map_err(|err| {
+            Storage::Gridstore(store) => store.write().clear().map_err(|err| {
                 OperationError::service_error(format!(
                     "Failed to clear mutable numeric index: {err}",
                 ))
             }),
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -411,8 +374,7 @@ where
         match self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.remove_column_family(),
-            Storage::Gridstore(mut store @ Some(_)) => {
-                let store = store.take().unwrap();
+            Storage::Gridstore(store) => {
                 let store =
                     Arc::into_inner(store).expect("exclusive strong reference to Gridstore");
 
@@ -422,7 +384,6 @@ where
                     ))
                 })
             }
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -434,12 +395,11 @@ where
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(_) => Ok(()),
-            Storage::Gridstore(Some(index)) => index.read().clear_cache().map_err(|err| {
+            Storage::Gridstore(index) => index.read().clear_cache().map_err(|err| {
                 OperationError::service_error(format!(
                     "Failed to clear mutable numeric index gridstore cache: {err}"
                 ))
             }),
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -448,8 +408,7 @@ where
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(_) => vec![],
-            Storage::Gridstore(Some(store)) => store.read().files(),
-            Storage::Gridstore(None) => vec![],
+            Storage::Gridstore(store) => store.read().files(),
         }
     }
 
@@ -458,7 +417,7 @@ where
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.flusher(),
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 let store = Arc::downgrade(store);
                 Box::new(move || {
                     store
@@ -477,7 +436,6 @@ where
                         })
                 })
             }
-            Storage::Gridstore(None) => Box::new(|| Ok(())),
         }
     }
 
@@ -501,10 +459,10 @@ where
                 }
             }
             // We cannot store empty value, then delete instead
-            Storage::Gridstore(Some(store)) if values.is_empty() => {
+            Storage::Gridstore(store) if values.is_empty() => {
                 store.write().delete_value(idx);
             }
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
                 store
                     .write()
@@ -514,11 +472,6 @@ where
                             "failed to put value in mutable numeric index gridstore: {err}"
                         ))
                     })?;
-            }
-            Storage::Gridstore(None) => {
-                return Err(OperationError::service_error(
-                    "Failed to add values to mutable numeric index, backing Gridstore storage does not exist",
-                ));
             }
         }
 
@@ -541,13 +494,8 @@ where
                     })
                     .transpose()?;
             }
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 store.write().delete_value(idx);
-            }
-            Storage::Gridstore(None) => {
-                return Err(OperationError::service_error(
-                    "Failed to remove values to mutable numeric index, backing Gridstore storage does not exist",
-                ));
             }
         }
 

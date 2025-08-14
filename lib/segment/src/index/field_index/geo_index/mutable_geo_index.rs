@@ -44,7 +44,7 @@ pub struct MutableGeoMapIndex {
 enum Storage {
     #[cfg(feature = "rocksdb")]
     RocksDb(DatabaseColumnScheduledDeleteWrapper),
-    Gridstore(Option<Arc<RwLock<Gridstore<Vec<RawGeoPoint>>>>>),
+    Gridstore(Arc<RwLock<Gridstore<Vec<RawGeoPoint>>>>),
 }
 
 pub struct InMemoryGeoMapIndex {
@@ -76,143 +76,103 @@ pub struct InMemoryGeoMapIndex {
 }
 
 impl MutableGeoMapIndex {
-    /// Open mutable geo index from RocksDB storage
-    ///
-    /// Note: after opening, the data must be loaded into memory separately using [`load`].
+    /// Open and load mutable geo index from RocksDB storage
     #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb(db: Arc<RwLock<DB>>, store_cf_name: &str) -> Self {
+    pub fn open_rocksdb(
+        db: Arc<RwLock<DB>>,
+        store_cf_name: &str,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
             db,
             store_cf_name,
         ));
-        Self {
-            in_memory_index: InMemoryGeoMapIndex::new(),
-            storage: Storage::RocksDb(db_wrapper),
-        }
-    }
-
-    /// Open mutable geo index from Gridstore storage
-    ///
-    /// Note: after opening, the data must be loaded into memory separately using [`load`].
-    ///
-    /// The `create_if_missing` parameter indicates whether to create a new Gridstore if it does
-    /// not exist. If false and files don't exist, the load function will indicate nothing could be
-    /// loaded.
-    pub fn open_gridstore(path: PathBuf, create_if_missing: bool) -> OperationResult<Self> {
-        let store = if create_if_missing {
-            Some(Arc::new(RwLock::new(
-                Gridstore::open_or_create(path, GRIDSTORE_OPTIONS).map_err(|err| {
-                    OperationError::service_error(format!(
-                        "failed to open mutable geo index on gridstore: {err}"
-                    ))
-                })?,
-            )))
-        } else if path.exists() {
-            Some(Arc::new(RwLock::new(Gridstore::open(path).map_err(
-                |err| {
-                    OperationError::service_error(format!(
-                        "failed to open mutable geo index on gridstore: {err}"
-                    ))
-                },
-            )?)))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            in_memory_index: InMemoryGeoMapIndex::new(),
-            storage: Storage::Gridstore(store),
-        })
-    }
-
-    /// Load storage
-    ///
-    /// Loads in-memory index from backing RocksDB or Gridstore storage.
-    pub(super) fn load(&mut self) -> OperationResult<bool> {
-        match self.storage {
-            #[cfg(feature = "rocksdb")]
-            Storage::RocksDb(_) => self.load_rocksdb(),
-            Storage::Gridstore(Some(_)) => self.load_gridstore(),
-            Storage::Gridstore(None) => Ok(false),
-        }
-    }
-
-    /// Load from RocksDB storage
-    ///
-    /// Loads in-memory index from RocksDB storage.
-    #[cfg(feature = "rocksdb")]
-    fn load_rocksdb(&mut self) -> OperationResult<bool> {
-        let Storage::RocksDb(db_wrapper) = &self.storage else {
-            return Err(OperationError::service_error(
-                "Failed to load index from RocksDB, using different storage backend",
-            ));
-        };
 
         if !db_wrapper.has_column_family()? {
-            return Ok(false);
+            if create_if_missing {
+                db_wrapper.recreate_column_family()?;
+            } else {
+                // Column family doesn't exist, cannot load
+                return Ok(None);
+            }
         };
 
+        // Load in-memory index from RocksDB
+        let mut in_memory_index = InMemoryGeoMapIndex::new();
         let mut points_to_hashes: BTreeMap<PointOffsetType, Vec<GeoHash>> = Default::default();
 
         for (key, value) in db_wrapper.lock_db().iter()? {
             let (geo_hash, idx) = GeoMapIndex::decode_db_key(key)?;
             let geo_point = GeoMapIndex::decode_db_value(value)?;
 
-            if self.in_memory_index.point_to_values.len() <= idx as usize {
-                self.in_memory_index
+            if in_memory_index.point_to_values.len() <= idx as usize {
+                in_memory_index
                     .point_to_values
                     .resize_with(idx as usize + 1, Vec::new);
             }
 
-            if self.in_memory_index.point_to_values[idx as usize].is_empty() {
-                self.in_memory_index.points_count += 1;
+            if in_memory_index.point_to_values[idx as usize].is_empty() {
+                in_memory_index.points_count += 1;
             }
 
             points_to_hashes.entry(idx).or_default().push(geo_hash);
 
-            self.in_memory_index.point_to_values[idx as usize].push(geo_point);
-            self.in_memory_index
+            in_memory_index.point_to_values[idx as usize].push(geo_point);
+            in_memory_index
                 .points_map
                 .entry(geo_hash)
                 .or_default()
                 .insert(idx);
 
-            self.in_memory_index.points_values_count += 1;
+            in_memory_index.points_values_count += 1;
         }
 
         for (_idx, geo_hashes) in points_to_hashes {
-            self.in_memory_index.max_values_per_point =
-                max(self.in_memory_index.max_values_per_point, geo_hashes.len());
-            self.in_memory_index
-                .increment_hash_point_counts(&geo_hashes);
+            in_memory_index.max_values_per_point =
+                max(in_memory_index.max_values_per_point, geo_hashes.len());
+            in_memory_index.increment_hash_point_counts(&geo_hashes);
             for geo_hash in geo_hashes {
-                self.in_memory_index.increment_hash_value_counts(&geo_hash);
+                in_memory_index.increment_hash_value_counts(&geo_hash);
             }
         }
-        Ok(true)
+
+        Ok(Some(Self {
+            in_memory_index,
+            storage: Storage::RocksDb(db_wrapper),
+        }))
     }
 
-    /// Load from Gridstore storage
+    /// Open and load mutable geo index from Gridstore storage
     ///
-    /// Loads in-memory index from Gridstore storage.
-    fn load_gridstore(&mut self) -> OperationResult<bool> {
-        let Storage::Gridstore(Some(store)) = &self.storage else {
-            return Err(OperationError::service_error(
-                "Failed to load index from Gridstore, using different storage backend",
-            ));
+    /// The `create_if_missing` parameter indicates whether to create a new Gridstore if it does
+    /// not exist. If false and files don't exist, the load function will indicate nothing could be
+    /// loaded.
+    pub fn open_gridstore(path: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        let store = if create_if_missing {
+            Gridstore::open_or_create(path, GRIDSTORE_OPTIONS).map_err(|err| {
+                OperationError::service_error(format!(
+                    "failed to open mutable geo index on gridstore: {err}"
+                ))
+            })?
+        } else if path.exists() {
+            Gridstore::open(path).map_err(|err| {
+                OperationError::service_error(format!(
+                    "failed to open mutable geo index on gridstore: {err}"
+                ))
+            })?
+        } else {
+            // Files don't exist, cannot load
+            return Ok(None);
         };
 
+        // Load in-memory index from Gridstore
+        let mut in_memory_index = InMemoryGeoMapIndex::new();
         let hw_counter = HardwareCounterCell::disposable();
         let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
         store
-            .read()
             .iter::<_, OperationError>(
-                |idx, values| {
-                    let geo_points = values
-                        .iter()
-                        .cloned()
-                        .map(GeoPoint::from)
-                        .collect::<Vec<_>>();
+                |idx, values: Vec<RawGeoPoint>| {
+                    let geo_points = values.into_iter().map(GeoPoint::from).collect::<Vec<_>>();
                     let geo_hashes = geo_points
                         .iter()
                         .map(|geo_point| {
@@ -223,27 +183,26 @@ impl MutableGeoMapIndex {
                         .collect::<Result<Vec<_>, _>>()?;
 
                     for geo_point in geo_points {
-                        if self.in_memory_index.point_to_values.len() <= idx as usize {
-                            self.in_memory_index
+                        if in_memory_index.point_to_values.len() <= idx as usize {
+                            in_memory_index
                                 .point_to_values
                                 .resize_with(idx as usize + 1, Vec::new);
                         }
 
-                        if self.in_memory_index.point_to_values[idx as usize].is_empty() {
-                            self.in_memory_index.points_count += 1;
+                        if in_memory_index.point_to_values[idx as usize].is_empty() {
+                            in_memory_index.points_count += 1;
                         }
 
-                        self.in_memory_index.point_to_values[idx as usize].push(geo_point);
-                        self.in_memory_index.points_values_count += 1;
+                        in_memory_index.point_to_values[idx as usize].push(geo_point);
+                        in_memory_index.points_values_count += 1;
                     }
 
-                    self.in_memory_index.max_values_per_point =
-                        max(self.in_memory_index.max_values_per_point, geo_hashes.len());
-                    self.in_memory_index
-                        .increment_hash_point_counts(&geo_hashes);
+                    in_memory_index.max_values_per_point =
+                        max(in_memory_index.max_values_per_point, geo_hashes.len());
+                    in_memory_index.increment_hash_point_counts(&geo_hashes);
                     for geo_hash in geo_hashes {
-                        self.in_memory_index.increment_hash_value_counts(&geo_hash);
-                        self.in_memory_index
+                        in_memory_index.increment_hash_value_counts(&geo_hash);
+                        in_memory_index
                             .points_map
                             .entry(geo_hash)
                             .or_default()
@@ -260,7 +219,10 @@ impl MutableGeoMapIndex {
                 ))
             })?;
 
-        Ok(true)
+        Ok(Some(Self {
+            in_memory_index,
+            storage: Storage::Gridstore(Arc::new(RwLock::new(store))),
+        }))
     }
 
     #[cfg_attr(not(feature = "rocksdb"), expect(dead_code))]
@@ -269,10 +231,9 @@ impl MutableGeoMapIndex {
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.recreate_column_family(),
-            Storage::Gridstore(Some(store)) => store.write().clear().map_err(|err| {
+            Storage::Gridstore(store) => store.write().clear().map_err(|err| {
                 OperationError::service_error(format!("Failed to clear mutable geo index: {err}",))
             }),
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -281,8 +242,7 @@ impl MutableGeoMapIndex {
         match self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.remove_column_family(),
-            Storage::Gridstore(mut store @ Some(_)) => {
-                let store = store.take().unwrap();
+            Storage::Gridstore(store) => {
                 let store =
                     Arc::into_inner(store).expect("exclusive strong reference to Gridstore");
 
@@ -292,7 +252,6 @@ impl MutableGeoMapIndex {
                     ))
                 })
             }
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -304,12 +263,11 @@ impl MutableGeoMapIndex {
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(_) => Ok(()),
-            Storage::Gridstore(Some(index)) => index.read().clear_cache().map_err(|err| {
+            Storage::Gridstore(index) => index.read().clear_cache().map_err(|err| {
                 OperationError::service_error(format!(
                     "Failed to clear mutable geo index gridstore cache: {err}"
                 ))
             }),
-            Storage::Gridstore(None) => Ok(()),
         }
     }
 
@@ -318,8 +276,7 @@ impl MutableGeoMapIndex {
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(_) => vec![],
-            Storage::Gridstore(Some(store)) => store.read().files(),
-            Storage::Gridstore(None) => vec![],
+            Storage::Gridstore(store) => store.read().files(),
         }
     }
 
@@ -328,7 +285,7 @@ impl MutableGeoMapIndex {
         match &self.storage {
             #[cfg(feature = "rocksdb")]
             Storage::RocksDb(db_wrapper) => db_wrapper.flusher(),
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 let store = Arc::downgrade(store);
                 Box::new(move || {
                     store
@@ -347,7 +304,6 @@ impl MutableGeoMapIndex {
                         })
                 })
             }
-            Storage::Gridstore(None) => Box::new(|| Ok(())),
         }
     }
 
@@ -374,10 +330,10 @@ impl MutableGeoMapIndex {
                 }
             }
             // We cannot store empty value, then delete instead
-            Storage::Gridstore(Some(store)) if values.is_empty() => {
+            Storage::Gridstore(store) if values.is_empty() => {
                 store.write().delete_value(idx);
             }
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
                 let values = values
                     .iter()
@@ -392,11 +348,6 @@ impl MutableGeoMapIndex {
                             "failed to put value in mutable geo index gridstore: {err}"
                         ))
                     })?;
-            }
-            Storage::Gridstore(None) => {
-                return Err(OperationError::service_error(
-                    "Failed to add values to mutable geo index, backing Gridstore storage does not exist",
-                ));
             }
         }
 
@@ -425,13 +376,8 @@ impl MutableGeoMapIndex {
                     db_wrapper.remove(&key)?;
                 }
             }
-            Storage::Gridstore(Some(store)) => {
+            Storage::Gridstore(store) => {
                 store.write().delete_value(idx);
-            }
-            Storage::Gridstore(None) => {
-                return Err(OperationError::service_error(
-                    "Failed to remove values to mutable geo index, backing Gridstore storage does not exist",
-                ));
             }
         }
 

@@ -76,7 +76,8 @@ pub struct InferenceService {
 static INFERENCE_SERVICE: RwLock<Option<Arc<InferenceService>>> = RwLock::new(None);
 
 impl InferenceService {
-    pub fn new(config: InferenceConfig) -> Self {
+    pub fn new(config: Option<InferenceConfig>) -> Self {
+        let config = config.unwrap_or_default();
         let timeout = Duration::from_secs(config.timeout);
         Self {
             config,
@@ -87,7 +88,7 @@ impl InferenceService {
         }
     }
 
-    pub fn init_global(config: InferenceConfig) -> Result<(), StorageError> {
+    pub fn init_global(config: Option<InferenceConfig>) -> Result<(), StorageError> {
         let mut inference_service = INFERENCE_SERVICE.write();
 
         let service = Self::new(config);
@@ -299,7 +300,8 @@ impl InferenceService {
     }
 
     fn is_address_valid(&self) -> bool {
-        !self.config.address.as_ref().is_none_or(|i| i.is_empty())
+        self.config.address.is_none() // In BM25 we don't need an address so we allow InferenceService to have an empty address.
+        || self.config.address.as_ref().is_some_and(|i| !i.is_empty())
     }
 }
 
@@ -331,13 +333,14 @@ fn merge_position_items<I>(
 mod test {
     use std::collections::HashMap;
 
+    use api::rest::Bm25Config;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::common::inference::bm25::{Bm25, Bm25Config};
+    use crate::common::inference::bm25::Bm25;
     use crate::common::inference::inference_input::InferenceDataType;
 
     const BM25_LOCAL_MODEL_NAME: &str = "bm25";
@@ -488,7 +491,7 @@ mod test {
             token: Some(String::default()),
         };
 
-        let service = InferenceService::new(config);
+        let service = InferenceService::new(Some(config));
 
         let has_remote_inference_items = inference_inputs
             .iter()

@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use self::memory::{BoolMemory, BooleanItem};
 use super::BoolIndex;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::map_index::IdIter;
@@ -187,20 +187,48 @@ pub struct SimpleBoolIndex {
 }
 
 impl SimpleBoolIndex {
-    pub fn new(db: Arc<RwLock<DB>>, field_name: &str) -> SimpleBoolIndex {
+    pub fn new(
+        db: Arc<RwLock<DB>>,
+        field_name: &str,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<SimpleBoolIndex>> {
         let store_cf_name = Self::storage_cf_name(field_name);
         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
             db,
             &store_cf_name,
         ));
-        Self {
-            memory: BoolMemory::new(),
-            db_wrapper,
+
+        if !db_wrapper.has_column_family()? {
+            if create_if_missing {
+                db_wrapper.recreate_column_family()?;
+            } else {
+                // Column family doesn't exist, cannot load
+                return Ok(None);
+            }
+        };
+
+        // Load in-memory index from RocksDB
+        let mut memory = BoolMemory::new();
+        for (key, value) in db_wrapper.lock_db().iter()? {
+            let idx = PointOffsetType::from_be_bytes(key.as_ref().try_into().unwrap());
+
+            debug_assert_eq!(value.len(), 1);
+
+            let item = BooleanItem::from(value[0]);
+            memory.set_or_insert(idx, &item);
         }
+
+        Ok(Some(Self { memory, db_wrapper }))
     }
 
-    pub fn builder(db: Arc<RwLock<DB>>, field_name: &str) -> BoolIndexBuilder {
-        BoolIndexBuilder(Self::new(db, field_name))
+    pub fn builder(db: Arc<RwLock<DB>>, field_name: &str) -> OperationResult<BoolIndexBuilder> {
+        Ok(BoolIndexBuilder(
+            Self::new(db, field_name, true)?.ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Failed to create and open SimpleBoolIndex for field: {field_name}",
+                ))
+            })?,
+        ))
     }
 
     fn storage_cf_name(field: &str) -> String {
@@ -305,22 +333,6 @@ impl FieldIndexBuilderTrait for BoolIndexBuilder {
 }
 
 impl PayloadFieldIndex for SimpleBoolIndex {
-    fn load(&mut self) -> OperationResult<bool> {
-        if !self.db_wrapper.has_column_family()? {
-            return Ok(false);
-        }
-
-        for (key, value) in self.db_wrapper.lock_db().iter()? {
-            let idx = PointOffsetType::from_be_bytes(key.as_ref().try_into().unwrap());
-
-            debug_assert_eq!(value.len(), 1);
-
-            let item = BooleanItem::from(value[0]);
-            self.memory.set_or_insert(idx, &item);
-        }
-        Ok(true)
-    }
-
     fn cleanup(self) -> OperationResult<()> {
         self.db_wrapper.remove_column_family()
     }

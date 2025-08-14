@@ -1,3 +1,4 @@
+use std::alloc::Layout;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use io::file_operations::atomic_save_json;
+use memory::mmap_type::MmapFlusher;
 use serde::{Deserialize, Serialize};
 
 use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
@@ -437,6 +439,10 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             .get_vector_data(i as _, self.metadata.vector_division.len())
     }
 
+    pub fn layout(&self) -> Layout {
+        Layout::from_size_align(self.metadata.vector_division.len(), align_of::<u8>()).unwrap()
+    }
+
     pub fn get_metadata(&self) -> &Metadata {
         &self.metadata
     }
@@ -579,6 +585,10 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         // `vector_division` size is equal to quantized vector size because each chunk is replaced by one `u8` centroid index.
         self.encoded_vectors
             .vectors_count(self.metadata.vector_division.len())
+    }
+
+    fn flusher(&self) -> MmapFlusher {
+        self.encoded_vectors.flusher()
     }
 }
 

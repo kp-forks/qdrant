@@ -458,7 +458,9 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
-        let mmap = MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching).unwrap();
+        let mmap = MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching)
+            .unwrap()
+            .unwrap();
 
         let imm_mmap = ImmutableInvertedIndex::from(&mmap);
 
@@ -477,14 +479,7 @@ mod tests {
                 .collect::<HashSet<_>>();
 
             // Check mutable vs mmap
-            let mmap_ids = mmap
-                .storage
-                .as_ref()
-                .unwrap()
-                .postings
-                .iter_ids(token_id)
-                .unwrap()
-                .collect();
+            let mmap_ids = mmap.storage.postings.iter_ids(token_id).unwrap().collect();
             assert_eq!(mutable_ids, mmap_ids);
 
             // Check mutable vs immutable mmap
@@ -499,25 +494,14 @@ mod tests {
         for (point_id, count) in immutable.point_to_tokens_count.iter().enumerate() {
             // Check same deleted points
             assert_eq!(
-                mmap.storage
-                    .as_ref()
-                    .unwrap()
-                    .deleted_points
-                    .get(point_id)
-                    .unwrap(),
+                mmap.storage.deleted_points.get(point_id).unwrap(),
                 *count == 0,
                 "point_id: {point_id}",
             );
 
             // Check same count
             assert_eq!(
-                *mmap
-                    .storage
-                    .as_ref()
-                    .unwrap()
-                    .point_to_tokens_count
-                    .get(point_id)
-                    .unwrap(),
+                *mmap.storage.point_to_tokens_count.get(point_id).unwrap(),
                 *count
             );
             assert_eq!(imm_mmap.point_to_tokens_count[point_id], *count);
@@ -541,7 +525,9 @@ mod tests {
         let immutable = ImmutableInvertedIndex::from(mut_index.clone());
         MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
         let mut mmap_index =
-            MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching).unwrap();
+            MmapInvertedIndex::open(mmap_dir.path().into(), false, phrase_matching)
+                .unwrap()
+                .unwrap();
 
         let mut imm_mmap_index = ImmutableInvertedIndex::from(&mmap_index);
 

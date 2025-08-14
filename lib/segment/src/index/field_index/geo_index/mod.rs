@@ -53,45 +53,62 @@ pub enum GeoMapIndex {
 
 impl GeoMapIndex {
     #[cfg(feature = "rocksdb")]
-    pub fn new_memory(db: Arc<RwLock<DB>>, field: &str, is_appendable: bool) -> Self {
+    pub fn new_memory(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        is_appendable: bool,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         let store_cf_name = GeoMapIndex::storage_cf_name(field);
-        if is_appendable {
-            GeoMapIndex::Mutable(MutableGeoMapIndex::open_rocksdb(db, &store_cf_name))
+        let index = if is_appendable {
+            MutableGeoMapIndex::open_rocksdb(db, &store_cf_name, create_if_missing)?
+                .map(GeoMapIndex::Mutable)
         } else {
-            GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_rocksdb(db, &store_cf_name))
-        }
+            ImmutableGeoMapIndex::open_rocksdb(db, &store_cf_name)?.map(GeoMapIndex::Immutable)
+        };
+        Ok(index)
     }
 
-    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
-        let mmap_index = MmapGeoMapIndex::open(path, is_on_disk)?;
-        if is_on_disk {
-            Ok(GeoMapIndex::Mmap(Box::new(mmap_index)))
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Option<Self>> {
+        let Some(mmap_index) = MmapGeoMapIndex::open(path, is_on_disk)? else {
+            // Files don't exist, cannot load
+            return Ok(None);
+        };
+
+        let index = if is_on_disk {
+            GeoMapIndex::Mmap(Box::new(mmap_index))
         } else {
-            Ok(GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
-                mmap_index,
-            )))
-        }
+            GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(mmap_index))
+        };
+
+        Ok(Some(index))
     }
 
-    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Self> {
-        Ok(GeoMapIndex::Mutable(MutableGeoMapIndex::open_gridstore(
-            dir,
-            create_if_missing,
-        )?))
+    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        Ok(MutableGeoMapIndex::open_gridstore(dir, create_if_missing)?.map(GeoMapIndex::Mutable))
     }
 
     #[cfg(feature = "rocksdb")]
-    pub fn builder(db: Arc<RwLock<DB>>, field: &str) -> GeoMapIndexBuilder {
-        GeoMapIndexBuilder(Self::new_memory(db, field, true))
+    pub fn builder(db: Arc<RwLock<DB>>, field: &str) -> OperationResult<GeoMapIndexBuilder> {
+        let index = Self::new_memory(db, field, true, true)?.ok_or_else(|| {
+            OperationError::service_error("Failed to open GeoMapIndex after creating it")
+        })?;
+        Ok(GeoMapIndexBuilder(index))
     }
 
     #[cfg(all(test, feature = "rocksdb"))]
-    pub fn builder_immutable(db: Arc<RwLock<DB>>, field: &str) -> GeoMapImmutableIndexBuilder {
-        GeoMapImmutableIndexBuilder {
-            index: Self::new_memory(db.clone(), field, true),
+    pub fn builder_immutable(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+    ) -> OperationResult<GeoMapImmutableIndexBuilder> {
+        let index = Self::new_memory(db.clone(), field, true, true)?.ok_or_else(|| {
+            OperationError::service_error("Failed to open GeoMapIndex after creating it")
+        })?;
+        Ok(GeoMapImmutableIndexBuilder {
+            index,
             field: field.to_owned(),
             db,
-        }
+        })
     }
 
     pub fn builder_mmap(path: &Path, is_on_disk: bool) -> GeoMapIndexMmapBuilder {
@@ -505,8 +522,10 @@ impl FieldIndexBuilderTrait for GeoMapImmutableIndexBuilder {
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
         drop(self.index);
-        let mut immutable_index = GeoMapIndex::new_memory(self.db, &self.field, false);
-        immutable_index.load()?;
+        let immutable_index = GeoMapIndex::new_memory(self.db, &self.field, false, false)?
+            .ok_or_else(|| {
+                OperationError::service_error("Failed to open GeoMapIndex after creating it")
+            })?;
         Ok(immutable_index)
     }
 }
@@ -613,8 +632,11 @@ impl FieldIndexBuilderTrait for GeoMapIndexGridstoreBuilder {
             self.index.is_none(),
             "index must be initialized exactly once",
         );
-        self.index
-            .replace(GeoMapIndex::new_gridstore(self.dir.clone(), true)?);
+        self.index.replace(
+            GeoMapIndex::new_gridstore(self.dir.clone(), true)?.ok_or_else(|| {
+                OperationError::service_error("Failed to open GeoMapIndex after creating it")
+            })?,
+        );
         Ok(())
     }
 
@@ -646,14 +668,6 @@ impl FieldIndexBuilderTrait for GeoMapIndexGridstoreBuilder {
 impl PayloadFieldIndex for GeoMapIndex {
     fn count_indexed_points(&self) -> usize {
         self.points_count()
-    }
-
-    fn load(&mut self) -> OperationResult<bool> {
-        match self {
-            GeoMapIndex::Mutable(index) => index.load(),
-            GeoMapIndex::Immutable(index) => index.load(),
-            GeoMapIndex::Mmap(index) => index.load(),
-        }
     }
 
     fn cleanup(self) -> OperationResult<()> {
@@ -877,8 +891,7 @@ mod tests {
                     };
 
                     // Load index from mmap
-                    let mut index = GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(*index));
-                    index.load()?;
+                    let index = GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(*index));
                     Ok(index)
                 }
             }
@@ -937,15 +950,15 @@ mod tests {
         let mut builder = match index_type {
             #[cfg(feature = "rocksdb")]
             IndexType::Mutable => {
-                IndexBuilder::Mutable(GeoMapIndex::builder(db.clone(), FIELD_NAME))
+                IndexBuilder::Mutable(GeoMapIndex::builder(db.clone(), FIELD_NAME).unwrap())
             }
             IndexType::MutableGridstore => IndexBuilder::MutableGridstore(
                 GeoMapIndex::builder_gridstore(temp_dir.path().to_path_buf()),
             ),
             #[cfg(feature = "rocksdb")]
-            IndexType::Immutable => {
-                IndexBuilder::Immutable(GeoMapIndex::builder_immutable(db.clone(), FIELD_NAME))
-            }
+            IndexType::Immutable => IndexBuilder::Immutable(
+                GeoMapIndex::builder_immutable(db.clone(), FIELD_NAME).unwrap(),
+            ),
             IndexType::Mmap => IndexBuilder::Mmap(GeoMapIndex::builder_mmap(temp_dir.path(), true)),
             IndexType::RamMmap => {
                 IndexBuilder::RamMmap(GeoMapIndex::builder_mmap(temp_dir.path(), false))
@@ -1490,20 +1503,29 @@ mod tests {
 
         #[cfg(feature = "rocksdb")]
         let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
-        let mut new_index = match index_type {
+        let new_index = match index_type {
             #[cfg(feature = "rocksdb")]
-            IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true),
+            IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true, true)
+                .unwrap()
+                .unwrap(),
             IndexType::MutableGridstore => {
-                GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true).unwrap()
+                GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true)
+                    .unwrap()
+                    .unwrap()
             }
             #[cfg(feature = "rocksdb")]
-            IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false),
-            IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false).unwrap(),
+            IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false, true)
+                .unwrap()
+                .unwrap(),
+            IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false)
+                .unwrap()
+                .unwrap(),
             IndexType::RamMmap => GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
-                MmapGeoMapIndex::open(temp_dir.path(), false).unwrap(),
+                MmapGeoMapIndex::open(temp_dir.path(), false)
+                    .unwrap()
+                    .unwrap(),
             )),
         };
-        new_index.load().unwrap();
 
         let berlin_geo_radius = GeoRadius {
             center: BERLIN,
@@ -1571,20 +1593,29 @@ mod tests {
 
         #[cfg(feature = "rocksdb")]
         let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
-        let mut new_index = match index_type {
+        let new_index = match index_type {
             #[cfg(feature = "rocksdb")]
-            IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true),
+            IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true, true)
+                .unwrap()
+                .unwrap(),
             IndexType::MutableGridstore => {
-                GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true).unwrap()
+                GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true)
+                    .unwrap()
+                    .unwrap()
             }
             #[cfg(feature = "rocksdb")]
-            IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false),
-            IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false).unwrap(),
+            IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false, true)
+                .unwrap()
+                .unwrap(),
+            IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false)
+                .unwrap()
+                .unwrap(),
             IndexType::RamMmap => GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
-                MmapGeoMapIndex::open(temp_dir.path(), false).unwrap(),
+                MmapGeoMapIndex::open(temp_dir.path(), false)
+                    .unwrap()
+                    .unwrap(),
             )),
         };
-        new_index.load().unwrap();
         assert_eq!(new_index.points_count(), 1);
         if index_type != IndexType::Mmap {
             assert_eq!(new_index.points_values_count(), 2);

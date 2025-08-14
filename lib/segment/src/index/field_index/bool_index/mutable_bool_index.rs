@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::types::PointOffsetType;
-use itertools::Either;
 use roaring::RoaringBitmap;
 
 use super::BoolIndex;
@@ -27,7 +26,7 @@ pub struct MutableBoolIndex {
     indexed_count: usize,
     trues_count: usize,
     falses_count: usize,
-    storage: Option<Storage>,
+    storage: Storage,
 }
 
 struct Storage {
@@ -37,30 +36,28 @@ struct Storage {
 
 impl MutableBoolIndex {
     pub fn builder(path: &Path) -> OperationResult<MutableBoolIndexBuilder> {
-        Ok(MutableBoolIndexBuilder(Self::open(path, true)?))
+        Ok(MutableBoolIndexBuilder(
+            Self::open(path, true)?.ok_or_else(|| {
+                OperationError::service_error("Failed to create and open MutableBoolIndex")
+            })?,
+        ))
     }
 
-    /// Open or create a boolean index at the given path.
+    /// Open and load or create a boolean index at the given path.
     ///
     /// # Arguments
     /// - `path` - The directory where the index files should live, must be exclusive to this index.
     /// - `is_on_disk` - If the index should be kept on disk. Memory will be populated if false.
     /// - `create_if_missing` - If true, creates the index if it doesn't exist.
-    pub fn open(path: &Path, create_if_missing: bool) -> OperationResult<Self> {
+    pub fn open(path: &Path, create_if_missing: bool) -> OperationResult<Option<Self>> {
         let falses_dir = path.join(FALSES_DIRNAME);
 
         // If falses directory doesn't exist, assume the index doesn't exist on disk
         if !falses_dir.is_dir() && !create_if_missing {
-            return Ok(Self {
-                base_dir: path.to_path_buf(),
-                storage: None,
-                indexed_count: 0,
-                trues_count: 0,
-                falses_count: 0,
-            });
+            return Ok(None);
         }
 
-        Self::open_or_create(path)
+        Ok(Some(Self::open_or_create(path)?))
     }
 
     fn open_or_create(path: &Path) -> OperationResult<Self> {
@@ -80,29 +77,30 @@ impl MutableBoolIndex {
         let falses_slice = DynamicMmapFlags::open(&falses_path, false)?;
         let falses_flags = RoaringFlags::new(falses_slice);
 
+        let trues_count = trues_flags.count_trues();
+        let falses_count = falses_flags.count_trues();
+        let indexed_count = {
+            let trues = trues_flags.get_bitmap();
+            let falses = falses_flags.get_bitmap();
+            trues.union_len(falses) as usize
+        };
+
         Ok(Self {
             base_dir: path.to_path_buf(),
-            storage: Some(Storage {
+            storage: Storage {
                 trues_flags,
                 falses_flags,
-            }),
-            // loading is done after opening during `PayloadFieldIndex::load()`
-            indexed_count: 0,
-            trues_count: 0,
-            falses_count: 0,
+            },
+            trues_count,
+            falses_count,
+            indexed_count,
         })
     }
 
-    fn set_or_insert(&mut self, id: u32, has_true: bool, has_false: bool) -> OperationResult<()> {
-        let Some(storage) = &mut self.storage else {
-            return Err(OperationError::service_error(
-                "MmapBoolIndex storage is not initialized",
-            ));
-        };
-
+    fn set_or_insert(&mut self, id: u32, has_true: bool, has_false: bool) {
         // Set or insert the flags
-        let prev_true = storage.trues_flags.set(id, has_true);
-        let prev_false = storage.falses_flags.set(id, has_false);
+        let prev_true = self.storage.trues_flags.set(id, has_true);
+        let prev_false = self.storage.falses_flags.set(id, has_false);
 
         let was_indexed = prev_true || prev_false;
         let is_indexed = has_true || has_false;
@@ -139,22 +137,14 @@ impl MutableBoolIndex {
             }
             _ => {}
         }
-
-        Ok(())
     }
 
-    fn get_bitmap_for(&self, value: bool) -> Option<&RoaringBitmap> {
-        let Some(storage) = &self.storage else {
-            return None;
-        };
-
-        let bitmap = if value {
-            storage.trues_flags.get_bitmap()
+    fn get_bitmap_for(&self, value: bool) -> &RoaringBitmap {
+        if value {
+            self.storage.trues_flags.get_bitmap()
         } else {
-            storage.falses_flags.get_bitmap()
-        };
-
-        Some(bitmap)
+            self.storage.falses_flags.get_bitmap()
+        }
     }
 
     fn get_count_for(&self, value: bool) -> usize {
@@ -162,17 +152,6 @@ impl MutableBoolIndex {
             self.trues_count
         } else {
             self.falses_count
-        }
-    }
-
-    /// Calculates the count of true values of the union of both slices.
-    fn calculate_indexed_count(&self) -> u32 {
-        if let Some(storage) = &self.storage {
-            let trues = storage.trues_flags.get_bitmap();
-            let falses = storage.falses_flags.get_bitmap();
-            trues.union_len(falses) as u32
-        } else {
-            0
         }
     }
 
@@ -187,92 +166,64 @@ impl MutableBoolIndex {
     }
 
     pub fn values_count(&self, point_id: PointOffsetType) -> usize {
-        let Some(storage) = &self.storage else {
-            return 0;
-        };
-
-        let has_true = storage.trues_flags.get(point_id);
-        let has_false = storage.falses_flags.get(point_id);
+        let has_true = self.storage.trues_flags.get(point_id);
+        let has_false = self.storage.falses_flags.get(point_id);
         usize::from(has_true) + usize::from(has_false)
     }
 
     pub fn check_values_any(&self, point_id: PointOffsetType, is_true: bool) -> bool {
-        let Some(storage) = &self.storage else {
-            return false;
-        };
-
         if is_true {
-            storage.trues_flags.get(point_id)
+            self.storage.trues_flags.get(point_id)
         } else {
-            storage.falses_flags.get(point_id)
+            self.storage.falses_flags.get(point_id)
         }
     }
 
     pub fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
-        let Some(storage) = &self.storage else {
-            return true;
-        };
-
-        !storage.trues_flags.get(point_id) && !storage.falses_flags.get(point_id)
+        !self.storage.trues_flags.get(point_id) && !self.storage.falses_flags.get(point_id)
     }
 
-    // TODO(payload-index-non-optional-storage): remove Either, just return pure iterator
     pub fn iter_values_map<'a>(
         &'a self,
         hw_counter: &'a HardwareCounterCell,
     ) -> impl Iterator<Item = (bool, IdIter<'a>)> + 'a {
-        let Some(storage) = &self.storage else {
-            return Either::Right(std::iter::empty());
-        };
-
-        let iter = [
-            (false, Box::new(storage.falses_flags.iter_trues()) as IdIter),
-            (true, Box::new(storage.trues_flags.iter_trues()) as IdIter),
+        [
+            (
+                false,
+                Box::new(self.storage.falses_flags.iter_trues()) as IdIter,
+            ),
+            (
+                true,
+                Box::new(self.storage.trues_flags.iter_trues()) as IdIter,
+            ),
         ]
         .into_iter()
         .measure_hw_with_acc(hw_counter.new_accumulator(), u8::BITS as usize, |i| {
             i.payload_index_io_read_counter()
-        });
-        Either::Left(iter)
+        })
     }
 
-    // TODO(payload-index-non-optional-storage): remove Either, just return pure iterator
     pub fn iter_values(&self) -> impl Iterator<Item = bool> + '_ {
-        let Some(storage) = &self.storage else {
-            return Either::Right(std::iter::empty());
-        };
-
-        let iter = [
-            storage.falses_flags.iter_trues().next().map(|_| false),
-            storage.trues_flags.iter_trues().next().map(|_| true),
+        [
+            self.storage.falses_flags.iter_trues().next().map(|_| false),
+            self.storage.trues_flags.iter_trues().next().map(|_| true),
         ]
         .into_iter()
-        .flatten();
-        Either::Left(iter)
+        .flatten()
     }
 
-    // TODO(payload-index-non-optional-storage): remove Either, just return pure iterator
     pub fn iter_counts_per_value(&self) -> impl Iterator<Item = (bool, usize)> + '_ {
-        let Some(storage) = &self.storage else {
-            return Either::Right(std::iter::empty());
-        };
-
-        let iter = [
-            (false, storage.falses_flags.count_trues()),
-            (true, storage.trues_flags.count_trues()),
+        [
+            (false, self.storage.falses_flags.count_trues()),
+            (true, self.storage.trues_flags.count_trues()),
         ]
-        .into_iter();
-        Either::Left(iter)
+        .into_iter()
     }
 
     pub(crate) fn get_point_values(&self, point_id: u32) -> Vec<bool> {
-        let Some(storage) = &self.storage else {
-            return vec![];
-        };
-
         [
-            storage.trues_flags.get(point_id).then_some(true),
-            storage.falses_flags.get(point_id).then_some(false),
+            self.storage.trues_flags.get(point_id).then_some(true),
+            self.storage.falses_flags.get(point_id).then_some(false),
         ]
         .into_iter()
         .flatten()
@@ -290,12 +241,8 @@ impl MutableBoolIndex {
 
     /// Drop disk cache.
     pub fn clear_cache(&self) -> OperationResult<()> {
-        if let Some(storage) = &self.storage {
-            storage.trues_flags.clear_cache()?;
-            storage.falses_flags.clear_cache()?;
-        }
-
-        Ok(())
+        self.storage.trues_flags.clear_cache()?;
+        self.storage.falses_flags.clear_cache()
     }
 }
 
@@ -339,7 +286,7 @@ impl ValueIndexer for MutableBoolIndex {
         let has_true = values.iter().any(|v| *v);
         let has_false = values.iter().any(|v| !*v);
 
-        self.set_or_insert(id, has_true, has_false)?;
+        self.set_or_insert(id, has_true, has_false);
 
         Ok(())
     }
@@ -349,7 +296,7 @@ impl ValueIndexer for MutableBoolIndex {
     }
 
     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
-        self.set_or_insert(id, false, false)?;
+        self.set_or_insert(id, false, false);
         Ok(())
     }
 }
@@ -357,34 +304,6 @@ impl ValueIndexer for MutableBoolIndex {
 impl PayloadFieldIndex for MutableBoolIndex {
     fn count_indexed_points(&self) -> usize {
         self.indexed_count
-    }
-
-    fn load(&mut self) -> OperationResult<bool> {
-        // Failed to load
-        if self.storage.is_none() {
-            return Ok(false);
-        }
-
-        let calculated_indexed_count = self.calculate_indexed_count();
-
-        // Destructure to not forget any fields
-        let Self {
-            base_dir: _,
-            indexed_count,
-            storage,
-            trues_count,
-            falses_count,
-        } = self;
-        let Storage {
-            trues_flags,
-            falses_flags,
-        } = storage.as_ref().unwrap();
-
-        *indexed_count = calculated_indexed_count as usize;
-        *trues_count = trues_flags.count_trues();
-        *falses_count = falses_flags.count_trues();
-
-        Ok(true)
     }
 
     fn cleanup(self) -> OperationResult<()> {
@@ -396,16 +315,12 @@ impl PayloadFieldIndex for MutableBoolIndex {
     }
 
     fn flusher(&self) -> crate::common::Flusher {
-        let Some(storage) = &self.storage else {
-            return Box::new(|| Ok(()));
-        };
-
         let Self {
             base_dir: _,
             indexed_count: _,
             trues_count: _,
             falses_count: _,
-            storage: _,
+            storage,
         } = self;
         let Storage {
             trues_flags,
@@ -423,12 +338,8 @@ impl PayloadFieldIndex for MutableBoolIndex {
     }
 
     fn files(&self) -> Vec<std::path::PathBuf> {
-        let Some(storage) = &self.storage else {
-            return vec![];
-        };
-
-        let mut files = storage.trues_flags.files();
-        files.extend(storage.falses_flags.files());
+        let mut files = self.storage.trues_flags.files();
+        files.extend(self.storage.falses_flags.files());
         files
     }
 
@@ -446,7 +357,7 @@ impl PayloadFieldIndex for MutableBoolIndex {
                 value: ValueVariants::Bool(value),
             })) => {
                 let iter = self
-                    .get_bitmap_for(*value)?
+                    .get_bitmap_for(*value)
                     .iter()
                     .map(|x| x as PointOffsetType)
                     .measure_hw_with_acc_and_fraction(
@@ -530,7 +441,7 @@ mod tests {
     #[test]
     fn test_files() {
         let dir = TempDir::with_prefix("test_mmap_bool_index").unwrap();
-        let index = MutableBoolIndex::open(dir.path(), true).unwrap();
+        let index = MutableBoolIndex::open(dir.path(), true).unwrap().unwrap();
 
         let reported = index.files().into_iter().collect::<HashSet<_>>();
 
